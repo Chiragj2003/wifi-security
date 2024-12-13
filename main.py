@@ -1,129 +1,132 @@
-import ssl
-import smtplib
+import re
 import time
+import Gmail
+import asyncio
 import requests
+import platform
 import subprocess
-from tkinter import *
-from PIL import ImageTk, Image
-from email.message import EmailMessage
-from decryption import decrypt_message
+from notifypy import Notify
+from threading import Thread
+from winsdk.windows.devices.geolocation import Geolocator
+from dotenv import load_dotenv
+import os
+
+load_dotenv() 
+sender_email = os.getenv("SENDER_EMAIL")
+receiver_email = os.getenv("RECEIVER_EMAIL")
+email_password = os.getenv("EMAIL_PASSWORD")
+ 
+ 
+def mac_address()->list:
+    response = subprocess.check_output(["arp", "-a"]).decode()
+    pattern = r"\w{2}-\w{2}-\w{2}-\w{2}-\w{2}-\w{2}"
+    mac_address = re.findall(pattern, response)
+    return mac_address
 
 
-def get_ip():
-    response = requests.get('https://api64.ipify.org?format=json').json()
-    return response["ip"]
+class Device:
+    def __init__(self) -> None:
+        self.coordinates = None
+        self.device_name = None
+        self.ip_address = None
+        self.isp = None
+        self.wifi_name = None
+
+    async def getGPSLocation():
+        locator = Geolocator()
+        pos = await locator.get_geoposition_async()
+        return {
+            "latitude": pos.coordinate.latitude,
+            "longitude": pos.coordinate.longitude,
+        }
+
+    def getGPSCoordinates(self):
+        try:
+            self.coordinates = asyncio.run(Device.getGPSLocation())
+        except PermissionError:
+            self.coordinates = {"latitude": None, "longitude": None}
+
+    def getIPAddress(self):
+        url = "https://api64.ipify.org/?format=json"
+        response = requests.get(url).json()
+        self.ip_address = response.get("ip")
+        
+    def googleMapLink(self, coordinates: dict) -> str:
+        url = f"https://www.google.com/maps/search/?api=1&query={coordinates.get('latitude')},{coordinates.get('longitude')}"
+        return url
+
+    def getDeviceName(self):
+        self.device_name = platform.node()
+
+    def getWifiName(self):
+        response = subprocess.check_output(['netsh', 'wlan', 'show', 'interface']).decode()
+        pattern = r"SSID\s+:\s[0-9a-zA-Z ]+"
+        result = re.findall(pattern, response)[0]
+        wifi_name = result.split(":")
+        self.wifi_name = wifi_name[1].strip()
+
+    def getDeviceData(self) -> dict:
+        t1 = Thread(target=self.getIPAddress)
+        t2 = Thread(target=self.getGPSCoordinates)
+        t3 = Thread(target=self.getDeviceName)
+        t4 = Thread(target = self.getWifiName)
+
+        t1.start(), t2.start(), t3.start(), t4.start()
+        macaddress = mac_address()[0]
+        t2.join()
+        url = self.googleMapLink(self.coordinates)
+        t1.join(), t3.join(), t4.join()
+
+        data = {
+            "device_name": self.device_name,
+            "ip_address": self.ip_address,
+            "mac_address": macaddress,
+            "map_url": url,
+            "isp": self.isp,
+            "wifi_name": self.wifi_name
+        }
+        return data
 
 
-def getOtherInformation() -> str:
-    try:
-        otherInfo = subprocess.check_output(["netsh", "wlan", "show", "interface"])
-        otherInfo = otherInfo.decode()
-        return otherInfo
-    except Exception as e:
-        return "Not Available"
+async def anonymous_network(verified_mac_address:tuple):
+    while True:
+        mac =  mac_address()
+        if len(mac)!=0:
+            if mac[0] not in verified_mac_address:
+                return True
+        time.sleep(1)
+        
+
+def Notificaton():
+    notification = Notify()
+    notification.application_name  = "Warning"
+    notification.icon = "alert.png"
+    notification.message = "We have detected unusual network activity from your device. To protect your network, please turn off your Wi-Fi. An email has been sent to Admin"
+    notification.title = ""
+    notification.send()
 
 
-def sendMail(bodyDetails):
-    addresses = subprocess.check_output(['arp', '-a'])
-    addresses = addresses.decode()
-    deviceName = subprocess.check_output(['wmic', 'csproduct', 'get', 'name'])
-    deviceName = deviceName.decode()
-    sender_email = ""
-    passWord = ""
-    receiver_email = ""
+if __name__ == "__main__":
+    connection = False
+    # tuple of verified mac addresses
+    verified_mac_addresses = ('d2-20-41-ef-8b-15', "d2-20-41-ef-8b-14")
+    while True:
+        if connection is False:
+            response = asyncio.run(anonymous_network(verified_mac_addresses))
+            if response is True:
+                connection = True
+                credentials = {
+                    "sender": sender_email,  # Sender email address from .env
+                    "receiver": receiver_email,  # Receiver email address from .env
+                    "password": email_password  
+                }
+                thread = Thread(target= Notificaton)
+                thread.start()
+                device_info = Device().getDeviceData()
+                Gmail.sendGmail(device_info, credentials)
+                thread.join()
+        else:
+            mac = mac_address()
+            if len(mac) == 0:
+                connection = False
 
-    subject = "Alert! Someone is trying to connect with your system. "
-    otherInfo = getOtherInformation()
-    body = "PC " + deviceName + "\n" + bodyDetails + "\nOther Informations about the network\n" + otherInfo + "\nThe details of the network : \n" + addresses
-
-    em = EmailMessage()
-    em['From'] = sender_email
-    em['To'] = receiver_email
-    em['Subject'] = subject
-    em.set_content(body)
-
-    context = ssl.create_default_context()
-    with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=context) as smtp:
-        smtp.login(sender_email, passWord)
-        smtp.sendmail(sender_email, receiver_email, em.as_string())
-
-
-def getAddress() -> str:
-    addresses = subprocess.check_output(['arp', '-a'])
-    addresses = addresses.decode()
-    for addresses in addresses.split():
-        if addresses.count('-') == 5:
-            macAddress = addresses
-            break
-    return macAddress
-
-
-def checkValidity(macAddress, approvedAddress) -> int:
-    for address in approvedAddress:
-        if decrypt_message(address) == macAddress:
-            return 1
-    return 0
-
-
-def checkWifi() -> bool:
-    response = subprocess.check_output(['arp', '-a'])
-    response = response.decode()
-    off = response.find('No')
-    if off == 0:
-        return False
-    else:
-        return True
-
-
-def mainFunction():
-    approvedAddresses = (b'gAAAAABlHRLlnFvEch7on6G38nV-BLOSQ9B1OAM-p7vIimmht9r0vZfy60ZA2V1iCXvwBzqviNkDemikXYrWt366BQGYAN7gy54dqpMiWRQjmty96llItcI=', b'gAAAAABlHRNimkI_ejuaaeCI28VdYNWA938Nft7SdTzUwWRL_56-YsUJuz4K5K8fcdnsxvAB2bLSG3btfRdyaOxTVsoxoZyr0LR9uIMofpkyQL2kp-2IbHs=')
-    macAddress = getAddress()
-    temp = checkValidity(macAddress, approvedAddresses)
-    ip_address = get_ip()
-    response = requests.post("http://ip-api.com/batch", json=
-    [{"query": ip_address}]).json()
-
-    location_details = "Country     : " + response[0]["country"] + "\nRegion Name : " + response[0][
-        "regionName"] + "\nCity        : " + response[0]["city"] + "\nPincode     : " + response[0][
-                           "zip"] + "\n\nNetwork operator  : " + response[0]["isp"] + "\n"
-    bodyDetails = location_details
-    root = Tk()
-    root.title("Warning")
-    root.iconbitmap(r'warning.ico')
-    if temp == 1:
-        root.geometry("350x40")
-        img = Image.open("true.png")
-        img = img.resize((20, 20))
-        my_img = ImageTk.PhotoImage(img)
-        myLabel1 = Label(root, image=my_img)
-        myLabel2 = Label(root, text="Connected Wifi network is approved")
-        myLabel1.grid(row=0, column=0, pady=10, padx=27)
-        myLabel2.grid(row=0, column=1, pady=10)
-    else:
-        root.geometry("400x70")
-        img = Image.open("denied.png")
-        img = img.resize((30, 30))
-        my_img = ImageTk.PhotoImage(img)
-        myLabel1 = Label(root, image=my_img)
-        myLabel2 = Label(root,
-                         text="Connected Wifi network is not approved.\nEmail has been send to the admin successfully")
-        myLabel1.grid(row=0, column=0, pady=15, padx=32)
-        myLabel2.grid(row=0, column=1, pady=15)
-        sendMail(bodyDetails)
-    root.mainloop()
-
-
-exit = 0
-move = 0
-while exit != 1:
-    move = 0
-    if (checkWifi() == True):
-        print("Main function is called")
-        mainFunction()
-        while move != 1:
-            if (checkWifi() == False):
-                move = 1
-            else:
-                time.sleep(5)
-    else:
-        time.sleep(10)
